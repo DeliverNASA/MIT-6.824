@@ -6,13 +6,16 @@ package main
 // go run mrsequential.go wc.so pg*.txt
 //
 
-import "fmt"
-import "../mr"
-import "plugin"
-import "os"
-import "log"
-import "io/ioutil"
-import "sort"
+import (
+	"fmt"
+	"io/ioutil"
+	"log"
+	"os"
+	"plugin"
+	"sort"
+
+	"../mr"
+)
 
 // for sorting by key.
 type ByKey []mr.KeyValue
@@ -28,6 +31,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 读取mapreduce编译生成的so文件
+	// mapf, reducef分别对应两个函数
 	mapf, reducef := loadPlugin(os.Args[1])
 
 	//
@@ -46,6 +51,8 @@ func main() {
 			log.Fatalf("cannot read %v", filename)
 		}
 		file.Close()
+		// mapf输入参数是string，也就是文件的内容，然后对key计数
+		// 注意这里的key是可以重复的，即一个word可以在文中出现多次，reduce的时候再统计
 		kva := mapf(filename, string(content))
 		intermediate = append(intermediate, kva...)
 	}
@@ -56,6 +63,7 @@ func main() {
 	// rather than being partitioned into NxM buckets.
 	//
 
+	// 按照名称进行排序
 	sort.Sort(ByKey(intermediate))
 
 	oname := "mr-out-0"
@@ -68,6 +76,7 @@ func main() {
 	i := 0
 	for i < len(intermediate) {
 		j := i + 1
+		// 把相同的key的value都聚集在一起，i和j之间的距离即表示了出现的次数，这里使用string存储"1"，所以string的长度就是统计值
 		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
 			j++
 		}
