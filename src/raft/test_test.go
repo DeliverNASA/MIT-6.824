@@ -162,23 +162,28 @@ func TestFailAgree2B(t *testing.T) {
 
 	// disconnect one follower from the network.
 	leader := cfg.checkOneLeader()
+
+	fmt.Printf("Test (2B): disconnect %v\n", (leader+1)%servers)
 	cfg.disconnect((leader + 1) % servers)
 
 	// the leader and remaining follower should be
 	// able to agree despite the disconnected follower.
 	cfg.one(102, servers-1, false)
 	cfg.one(103, servers-1, false)
+	fmt.Printf("Test (2B): sleep RaftElectionTimeout\n")
 	time.Sleep(RaftElectionTimeout)
 	cfg.one(104, servers-1, false)
 	cfg.one(105, servers-1, false)
 
 	// re-connect
+	fmt.Printf("Test (2B): connect %v\n", (leader+1)%servers)
 	cfg.connect((leader + 1) % servers)
 
 	// the full set of servers should preserve
 	// previous agreements, and be able to agree
 	// on new commands.
 	cfg.one(106, servers, true)
+	fmt.Printf("Test (2B): sleep RaftElectionTimeout\n")
 	time.Sleep(RaftElectionTimeout)
 	cfg.one(107, servers, true)
 
@@ -348,6 +353,8 @@ func TestRejoin2B(t *testing.T) {
 
 	// leader network failure
 	leader1 := cfg.checkOneLeader()
+
+	fmt.Printf("Test (2B): disconnect %d\n", leader1)
 	cfg.disconnect(leader1)
 
 	// make old leader try to agree on some entries
@@ -360,14 +367,18 @@ func TestRejoin2B(t *testing.T) {
 
 	// new leader network failure
 	leader2 := cfg.checkOneLeader()
+
+	fmt.Printf("Test (2B): disconnect %d\n", leader2)
 	cfg.disconnect(leader2)
 
 	// old leader connected again
+	fmt.Printf("Test (2B): connect %d\n", leader1)
 	cfg.connect(leader1)
 
 	cfg.one(104, 2, true)
 
 	// all together now
+	fmt.Printf("Test (2B): connect %d\n", leader2)
 	cfg.connect(leader2)
 
 	cfg.one(105, servers, true)
@@ -380,32 +391,52 @@ func TestBackup2B(t *testing.T) {
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
 
-	cfg.begin("Test (2B): leader backs up quickly over incorrect follower logs")
+	cfg.begin("\nTest (2B): leader backs up quickly over incorrect follower logs")
 
+	// 所有server都有log 1
 	cfg.one(rand.Int(), servers, true)
 
 	// put leader and one follower in a partition
 	leader1 := cfg.checkOneLeader()
+	fmt.Printf("\nTest (2B): disconnect %d, %d, %d\n", (leader1+2)%servers, (leader1+3)%servers, (leader1+4)%servers)
 	cfg.disconnect((leader1 + 2) % servers)
 	cfg.disconnect((leader1 + 3) % servers)
 	cfg.disconnect((leader1 + 4) % servers)
 
 	// submit lots of commands that won't commit
+	// server 1, 2 有log 2-51，commit失败
+
+	// server 1: 1, 2~51
+	// server 2: 1, 2~51
+	// server 3: 1
+	// server 4: 1
+	// server 5: 1
+
 	for i := 0; i < 50; i++ {
 		cfg.rafts[leader1].Start(rand.Int())
 	}
 
 	time.Sleep(RaftElectionTimeout / 2)
 
+	fmt.Printf("\nTest (2B): disconnect %d, %d\n", (leader1+0)%servers, (leader1+1)%servers)
 	cfg.disconnect((leader1 + 0) % servers)
 	cfg.disconnect((leader1 + 1) % servers)
 
 	// allow other partition to recover
+	fmt.Printf("\nTest (2B): connect %d, %d, %d\n", (leader1+2)%servers, (leader1+3)%servers, (leader1+4)%servers)
 	cfg.connect((leader1 + 2) % servers)
 	cfg.connect((leader1 + 3) % servers)
 	cfg.connect((leader1 + 4) % servers)
 
 	// lots of successful commands to new group.
+	// server 3, 4, 5 有log 52-101，commit成功
+
+	// server 1: 1, 2~51
+	// server 2: 1, 2~51
+	// server 3: 1, 52-101
+	// server 4: 1, 52-101
+	// server 5: 1, 52-101
+
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3, true)
 	}
@@ -416,9 +447,19 @@ func TestBackup2B(t *testing.T) {
 	if leader2 == other {
 		other = (leader2 + 1) % servers
 	}
+
+	fmt.Printf("\nTest (2B): disconnect %d\n", other)
 	cfg.disconnect(other)
 
 	// lots more commands that won't commit
+	// server 3, 4 有log 102-151，commit失败
+
+	// server 1: 1, 2~51
+	// server 2: 1, 2~51
+	// server 3: 1, 52-101, 102-151
+	// server 4: 1, 52-101, 102-151
+	// server 5: 1, 52-101
+
 	for i := 0; i < 50; i++ {
 		cfg.rafts[leader2].Start(rand.Int())
 	}
@@ -426,19 +467,30 @@ func TestBackup2B(t *testing.T) {
 	time.Sleep(RaftElectionTimeout / 2)
 
 	// bring original leader back to life,
+	fmt.Printf("\nTest (2B): disconnect all\n")
 	for i := 0; i < servers; i++ {
 		cfg.disconnect(i)
 	}
+	fmt.Printf("\nTest (2B): connect %d, %d, %d\n", (leader1+0)%servers, (leader1+1)%servers, other)
 	cfg.connect((leader1 + 0) % servers)
 	cfg.connect((leader1 + 1) % servers)
 	cfg.connect(other)
 
 	// lots of successful commands to new group.
+	// server 1, 2, 5 有log 152-201，commit成功
+
+	// server 1: 1, 2~51, 152-201
+	// server 2: 1, 2~51, 152-201
+	// server 3: 1, 52-101, 102-151
+	// server 4: 1, 52-101, 102-151
+	// server 5: 1, 52-101, 152-201
+
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3, true)
 	}
 
 	// now everyone
+	fmt.Printf("\nTest (2B): connect all\n")
 	for i := 0; i < servers; i++ {
 		cfg.connect(i)
 	}
