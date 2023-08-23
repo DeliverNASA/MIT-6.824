@@ -1,0 +1,326 @@
+package kvraft
+
+import (
+	"log"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"../labgob"
+	"../labrpc"
+	"../raft"
+)
+
+const Debug = 1
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		log.Printf(format, a...)
+	}
+	return
+}
+
+type Op struct {
+	// Your definitions here.
+	// Field names must start with capital letters,
+	// otherwise RPC will break.
+	RequestId int
+	Key       string
+	Value     string
+	Method    string
+}
+
+type Message struct {
+	Err   Err
+	Value string
+}
+
+type KVServer struct {
+	mu      sync.Mutex
+	me      int
+	rf      *raft.Raft
+	applyCh chan raft.ApplyMsg
+	dead    int32 // set by Kill()
+
+	maxraftstate int // snapshot if log grows this big
+
+	// Your definitions here.
+	data       map[string]string
+	MessageCh  map[int]chan Message
+	RequestMap map[int]bool
+}
+
+func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
+	// Your code here.
+	// if not leader, reject the get request
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		// DPrintf("%v is not a leader, cannot handle request %v", kv.me, args.RequestId)
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	DPrintf("[%v] is a leader, now handle REQ %v", kv.me, args.RequestId)
+
+	// 从这里入手，保证不会有两个GET请求并发执行，即在收到第一次请求的ErrTimeOut之前不允许触发第二次请求
+	// 直到删除了对应的channel才会触发
+	if kv.isExisted(args.RequestId) {
+		time.Sleep(200 * time.Millisecond)
+		reply.Err = ErrTimeOut
+		return
+	}
+
+	// start a agreement
+	op := Op{
+		RequestId: args.RequestId,
+		Key:       args.Key,
+		Method:    GET,
+	}
+	res := kv.waitcmd(op)
+	reply.Err = res.Err
+	reply.Value = res.Value
+	DPrintf("[%v] finish REQ %v %v receive (key, value) = (%v, %v)", kv.me, op.RequestId, op.Method, op.Key, reply.Value)
+}
+
+func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	// Your code here.
+	_, isleader := kv.rf.GetState()
+	if !isleader {
+		// DPrintf("%v is not a leader, cannot handle request %v", kv.me, args.RequestId)
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	DPrintf("[%v] is a leader, now handle REQ %v", kv.me, args.RequestId)
+
+	// 避免重复执行
+	if kv.isRepeated(args.RequestId) {
+		DPrintf("[%v] REQ %v has been handled", kv.me, args.RequestId)
+		reply.Err = OK
+		return
+	}
+
+	// 保证同一个时刻只有一个RequestId请求被处理，这是为了保护channel
+	if kv.isExisted(args.RequestId) {
+		time.Sleep(200 * time.Millisecond)
+		reply.Err = ErrTimeOut
+		return
+	}
+
+	op := Op{
+		RequestId: args.RequestId,
+		Key:       args.Key,
+		Value:     args.Value,
+		Method:    args.Op,
+	}
+	// DPrintf("%v is a leader, start reaching agreement...", kv.me)
+	res := kv.waitcmd(op)
+	// DPrintf("%v is a leader, finish reaching agreement.", kv.me)
+	reply.Err = res.Err
+	DPrintf("[%v] finish REQ %v %v (key, value) = (%v, %v)", kv.me, op.RequestId, op.Method, op.Key, op.Value)
+}
+
+func (kv *KVServer) timeout() {
+
+}
+
+func (kv *KVServer) waitcmd(op Op) (res Message) {
+	// make a Message channel to receive info
+	kv.rf.Start(op)
+
+	// _, term, isleader := kv.rf.Start(op)
+	// DPrintf("[%v] is leader: %v, term: %v", kv.me, isleader, term)
+
+	// DPrintf("[%v] try to get the lock in WAITCMD", kv.me)
+	kv.mu.Lock()
+	// DPrintf("[%v] success to get the lock in WAITCMD", kv.me)
+	kv.MessageCh[op.RequestId] = make(chan Message)
+	kv.mu.Unlock()
+	// DPrintf("[%v] release the lock in WAITCMD", kv.me)
+
+	// DPrintf("[%v] wait for REQ %v agreement...", kv.me, op.RequestId)
+	timer := time.NewTimer(time.Duration(REPLYTIMEOUT) * time.Second)
+	select {
+	case <-timer.C:
+		DPrintf("[%v] REQ %v agreement time out", kv.me, op.RequestId)
+		res.Err = ErrTimeOut
+		// DPrintf("[%v] try to get a lock in TIMEOUT", kv.me)
+		kv.mu.Lock()
+		// DPrintf("[%v] success to get a lock in TIMEOUT", kv.me)
+		DPrintf("[%v] delete messageCh %v", kv.me, op.RequestId)
+		delete(kv.MessageCh, op.RequestId)
+		kv.mu.Unlock()
+		// DPrintf("[%v] release the lock in TIMEOUT", kv.me)
+	case msg := <-kv.MessageCh[op.RequestId]:
+		DPrintf("[%v] receive REQ %d agreement Message, err = %v, value = %v", kv.me, op.RequestId, msg.Err, msg.Value)
+		res.Err = msg.Err
+		res.Value = msg.Value
+	}
+	return res
+}
+
+func (kv *KVServer) dataGet(key string) (Err, string) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	value, exists := kv.data[key]
+	if exists {
+		return OK, value
+	} else {
+		return ErrNoKey, ""
+	}
+}
+
+func (kv *KVServer) isRepeated(requestId int) bool {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if _, exists := kv.RequestMap[requestId]; exists {
+		return true
+	} else {
+		return false
+	}
+}
+
+func (kv *KVServer) isExisted(requestId int) bool {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if _, exists := kv.MessageCh[requestId]; exists {
+		return true
+	} else {
+		return false
+	}
+}
+
+func (kv *KVServer) waitApplyCh() {
+	for {
+		select {
+		case command := <-kv.applyCh:
+			DPrintf("[%v] waiting ApplyCh...", kv.me)
+			var msg Message
+			// DPrintf("%v get command %v, valid = %v, index = %v", kv.me, command.Command.(Op), command.CommandValid, command.CommandIndex)
+			if !command.CommandValid {
+				DPrintf("command is invalid")
+				continue
+			}
+			if op, ok := command.Command.(Op); ok {
+				switch op.Method {
+				case PUT:
+					if !kv.isRepeated(op.RequestId) {
+						// DPrintf("[%v] try to get the lock in PUT", kv.me)
+						kv.mu.Lock()
+						// DPrintf("[%v] success to get the lock in PUT", kv.me)
+						kv.data[op.Key] = op.Value
+						DPrintf("[%v] REQ %v, PUT OK. (key, value) = (%v, %v)", kv.me, op.RequestId, op.Key, kv.data[op.Key])
+						kv.mu.Unlock()
+						// DPrintf("[%v] release the lock in PUT", kv.me)
+					}
+					msg.Err = OK
+				case APPEND:
+					_, value := kv.dataGet(op.Key)
+					if !kv.isRepeated(op.RequestId) {
+						// DPrintf("[%v] try to get the lock in APPEND", kv.me)
+						kv.mu.Lock()
+						// DPrintf("[%v] success to get the lock in APPEND", kv.me)
+						kv.data[op.Key] = value + op.Value
+						DPrintf("[%v] REQ %v, APPEND OK. (key, value) = (%v, %v)", kv.me, op.RequestId, op.Key, kv.data[op.Key])
+						kv.mu.Unlock()
+						// DPrintf("[%v] release the lock in APPEND", kv.me)
+					}
+					msg.Err = OK
+				case GET:
+					err, value := kv.dataGet(op.Key)
+					msg.Err = err
+					msg.Value = value
+					DPrintf("[%v] REQ %v, GET %v. (key, value) = (%v, %v)", kv.me, op.RequestId, err, op.Key, value)
+				default:
+					DPrintf("cannot recoginize this data type %v", op.Method)
+				}
+
+				// DPrintf("[%v] try to get the lock in DATA", kv.me)
+				kv.mu.Lock()
+				// DPrintf("[%v] success to get the lock in DATA", kv.me)
+
+				// only guarantee PUT or APPEND exactly-once
+				if op.Method == PUT || op.Method == APPEND {
+					kv.RequestMap[op.RequestId] = true
+				}
+
+				// 只有在存在channel且没有到达timeout的时候才会触发写入，否则无法会因为持有锁写入无消费者的channel而导致阻塞
+				if msgCh, exists := kv.MessageCh[op.RequestId]; exists {
+					DPrintf("[%v] try to input msgCh %v ...", kv.me, op.RequestId)
+					msgCh <- msg
+					// 及时删除channel，保证消费和删除的原子性
+					delete(kv.MessageCh, op.RequestId)
+					DPrintf("[%v] delete messageCh %v", kv.me, op.RequestId)
+					DPrintf("[%v] success to input msgCh", kv.me)
+				}
+
+				kv.mu.Unlock()
+				// DPrintf("[%v] release the lock in DATA", kv.me)
+			} else {
+				DPrintf("cannot restore as a Op type.")
+			}
+		}
+		DPrintf("[%v] finish ApplyCh", kv.me)
+	}
+}
+
+//
+// the tester calls Kill() when a KVServer instance won't
+// be needed again. for your convenience, we supply
+// code to set rf.dead (without needing a lock),
+// and a killed() method to test rf.dead in
+// long-running loops. you can also add your own
+// code to Kill(). you're not required to do anything
+// about this, but it may be convenient (for example)
+// to suppress debug output from a Kill()ed instance.
+//
+func (kv *KVServer) Kill() {
+	atomic.StoreInt32(&kv.dead, 1)
+	kv.rf.Kill()
+	// Your code here, if desired.
+}
+
+func (kv *KVServer) killed() bool {
+	z := atomic.LoadInt32(&kv.dead)
+	return z == 1
+}
+
+//
+// servers[] contains the ports of the set of
+// servers that will cooperate via Raft to
+// form the fault-tolerant key/value service.
+// me is the index of the current server in servers[].
+// the k/v server should store snapshots through the underlying Raft
+// implementation, which should call persister.SaveStateAndSnapshot() to
+// atomically save the Raft state along with the snapshot.
+// the k/v server should snapshot when Raft's saved state exceeds maxraftstate bytes,
+// in order to allow Raft to garbage-collect its log. if maxraftstate is -1,
+// you don't need to snapshot.
+// StartKVServer() must return quickly, so it should start goroutines
+// for any long-running work.
+//
+func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
+	// call labgob.Register on structures you want
+	// Go's RPC library to marshall/unmarshall.
+	labgob.Register(Op{})
+
+	kv := new(KVServer)
+	kv.me = me
+	kv.maxraftstate = maxraftstate
+
+	// You may need initialization code here.
+	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+
+	kv.data = make(map[string]string)
+	kv.MessageCh = make(map[int]chan Message)
+	kv.RequestMap = make(map[int]bool)
+
+	// You may need initialization code here.
+	go kv.waitApplyCh()
+
+	return kv
+}

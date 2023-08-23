@@ -1,21 +1,33 @@
 package kvraft
 
+import "time"
+
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongLeader = "ErrWrongLeader"
+	OK                   = "OK"
+	ErrNoKey             = "ErrNoKey"
+	ErrWrongLeader       = "ErrWrongLeader"
+	ErrTimeOut           = "ErrTimeOut"
+	GET                  = "Get"
+	PUT                  = "Put"
+	APPEND               = "Append"
+	REPLYTIMEOUT         = time.Second * 2
+	ChangeLeaderInterval = time.Millisecond * 100
+	BeingHandledInterval = time.Millisecond * 500
 )
 
 type Err string
+
+type ClientRequest struct {
+	ClientId  int
+	RequestId int
+}
 
 // Put or Append
 type PutAppendArgs struct {
 	Key   string
 	Value string
 	Op    string // "Put" or "Append"
-	// You'll have to add definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	CR    ClientRequest
 }
 
 type PutAppendReply struct {
@@ -24,7 +36,7 @@ type PutAppendReply struct {
 
 type GetArgs struct {
 	Key string
-	// You'll have to add definitions here.
+	CR  ClientRequest
 }
 
 type GetReply struct {
