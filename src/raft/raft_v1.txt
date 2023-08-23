@@ -40,7 +40,7 @@ const (
 	HEARTBEAT_INTERNEL               = 50
 	COMMIT_INTERNEL                  = 100
 	BASE_ELECTION_TIMEOUT            = 300
-	MAX_ADDITIONALE_ELECTION_TIMEOUT = 400
+	MAX_ADDITIONALE_ELECTION_TIMEOUT = 200
 )
 
 //
@@ -88,10 +88,12 @@ type Raft struct {
 	applyCh     chan ApplyMsg // send applyMsg to the server
 
 	// additional variable
-	state           string    // leader, candidate or follower
-	HeartBeatChan   chan int  // channel to handle heartbeat
-	RequestVoteChan chan int  // channel to handle request vote
-	isLeaderChan    chan bool // channel to control time out election
+	state                 string    // leader, candidate or follower
+	HeartBeatChan         chan int  // channel to handle heartbeat
+	RequestVoteChan       chan int  // channel to handle request vote
+	isLeaderChan          chan bool // channel to control time out election
+	lastAppliedIndex      []int     // for each server, index of highest log entry known to be committed on server
+	availableAppliedIndex int       // leader's commit
 
 	// constant
 	serversNum int // number of peers
@@ -124,6 +126,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.commitIndex)
+	e.Encode(rf.availableAppliedIndex)
 	e.Encode(rf.logs)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
@@ -142,13 +145,20 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var commitIndex int
+	var availableAppliedIndex int
 	var logs []LogEntry
-	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&commitIndex) != nil || d.Decode(&logs) != nil {
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&commitIndex) != nil || d.Decode(&availableAppliedIndex) != nil || d.Decode(&logs) != nil {
 		DPrintf("Term %d: [%d] fails to decode.", rf.currentTerm, rf.me)
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
-		rf.commitIndex = commitIndex
+		// rf.commitIndex = commitIndex
+		if availableAppliedIndex < commitIndex {
+			rf.commitIndex = availableAppliedIndex
+		} else {
+			rf.commitIndex = commitIndex
+		}
+		rf.availableAppliedIndex = availableAppliedIndex
 		rf.logs = logs
 	}
 }
@@ -269,8 +279,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			old := rf.commitIndex
 			if args.LeaderCommit < lastID {
 				rf.commitIndex = args.LeaderCommit
+				rf.availableAppliedIndex = args.LeaderCommit
 			} else {
 				rf.commitIndex = lastID
+				rf.availableAppliedIndex = lastID
 			}
 			rf.persist()
 			DPrintf("Term %d: [%d] updates commitIndex: %d -> %d", rf.currentTerm, rf.me, old, rf.commitIndex)
@@ -281,6 +293,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	}
 
+	reply.LastApplied = rf.lastApplied
 	reply.Term = rf.currentTerm // attention!!!
 }
 
@@ -356,6 +369,10 @@ func (rf *Raft) CallAppendEntries(server int) bool {
 		if reply.Success {
 			rf.nextIndex[server] = length
 			rf.matchIndex[server] = length - 1
+			// avoid previous RPC reply changing lastAppliedIndex
+			if reply.LastApplied > rf.lastAppliedIndex[server] {
+				rf.lastAppliedIndex[server] = reply.LastApplied
+			}
 		} else {
 			// avoid previous RPC reply changing nextIndex
 			if reply.ConflictStartIndex < rf.nextIndex[server] {
@@ -389,9 +406,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 
 	// only follower has RequestVoteChan
-	// if rf.state != LEADER {
-	// 	rf.RequestVoteChan <- args.CandidateID
-	// }
+	if rf.state != LEADER {
+		rf.RequestVoteChan <- args.CandidateID
+	}
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -430,7 +447,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			if rf.logs[length-1].Term < candidateLastLogTerm ||
 				(rf.logs[length-1].Term == candidateLastLogTerm && (length-1) <= candidateLastLogIndex) {
 				// voting for others can reset timer
-				rf.RequestVoteChan <- args.CandidateID
+				// rf.RequestVoteChan <- args.CandidateID
 				reply.VoteGranted = true
 				rf.votedFor = candidateID
 				rf.persist()
@@ -509,8 +526,7 @@ func (rf *Raft) CallRequestVote(server int) bool {
 	// DPrintf("Term %d: [%d] state: %v, receive vote reply from [%d], reply.term = %d, voted: %v", rf.currentTerm, rf.me, rf.state, server, reply.Term, reply.VoteGranted)
 
 	// allow outdated reply to update state, otherwise it is hard to elect a leader in time
-	// need to consider
-	if rf.state != CANDIDATE || reply.Term < rf.currentTerm {
+	if rf.state != CANDIDATE {
 		return false
 	} else if rf.currentTerm < reply.Term {
 		rf.currentTerm = reply.Term
@@ -578,8 +594,10 @@ func (rf *Raft) AttemptElection() bool {
 			rf.nextIndex[i] = len(rf.logs)
 			if i == rf.me {
 				rf.matchIndex[i] = len(rf.logs) - 1
+				rf.lastAppliedIndex[i] = len(rf.logs) - 1
 			} else {
 				rf.matchIndex[i] = 0
+				rf.lastAppliedIndex[i] = 0
 			}
 		}
 
@@ -621,6 +639,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		index = len(rf.logs)
 		term = rf.currentTerm
 		rf.matchIndex[rf.me] = index
+		rf.lastAppliedIndex[rf.me] = index
 		logentry := LogEntry{Term: term, Command: command}
 		rf.logs = append(rf.logs, logentry)
 		rf.persist()
@@ -680,10 +699,18 @@ func (rf *Raft) CommitLogs() {
 			rf.commitIndex = commitIndex
 			rf.persist()
 		}
+
+		// update leader's availableAppliedIndex
+		appliedIndex := selectMajor(rf.lastAppliedIndex)
+		if appliedIndex > rf.availableAppliedIndex {
+			DPrintf("Term %d: [%d] updates availableAppliedIndex, %v -> %v", rf.currentTerm, rf.me, rf.availableAppliedIndex, appliedIndex)
+			rf.availableAppliedIndex = appliedIndex
+			rf.persist()
+		}
 	}
 
 	start := rf.lastApplied + 1
-	end := rf.commitIndex
+	end := rf.availableAppliedIndex
 	logs := rf.logs
 	rf.mu.Unlock()
 
@@ -756,6 +783,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.HeartBeatChan = make(chan int)
 	rf.RequestVoteChan = make(chan int)
 	rf.isLeaderChan = make(chan bool)
+	rf.lastAppliedIndex = make([]int, rf.serversNum)
+	rf.availableAppliedIndex = 0
 
 	// Your initialization code here (2A, 2B, 2C).
 	rand.Seed(time.Now().UnixNano())
